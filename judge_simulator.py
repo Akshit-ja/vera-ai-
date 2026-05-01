@@ -24,13 +24,13 @@ Author: magicpin AI Challenge Team
 BOT_URL = "http://localhost:8080"
 
 # Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
-LLM_PROVIDER = "gemini"
+LLM_PROVIDER = "openrouter"  # <-- Choose your provider
 
 # Your API key (paste your key here)
-LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
+LLM_API_KEY = "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"  # <-- PUT YOUR API KEY HERE
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
-LLM_MODEL = "gemini-2.5-flash"  # <-- Optional: specify model or leave empty for default
+LLM_MODEL = "meta-llama/llama-3.3-70b-instruct"  # <-- Optional: specify model or leave empty for default
 
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"

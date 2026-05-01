@@ -1,4 +1,5 @@
 import hashlib
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -54,13 +55,124 @@ def _safe_get(dct: Dict[str, Any], path: List[str], default: Any = None) -> Any:
 
 def _owner_name(merchant: Dict[str, Any], category: Dict[str, Any]) -> str:
     owner = _safe_get(merchant, ["identity", "owner_first_name"], "")
-    if not owner:
-        name = _safe_get(merchant, ["identity", "name"], "there")
-        return name
+    merchant_name = _safe_get(merchant, ["identity", "name"], "there")
     salutation_examples = _safe_get(category, ["voice", "salutation_examples"], [])
     if salutation_examples:
-        return salutation_examples[0].replace("{first_name}", owner)
-    return owner
+        template = salutation_examples[0]
+        replacements = {
+            "{first_name}": owner or merchant_name,
+            "{chef_or_owner_first_name}": owner or merchant_name,
+            "{pharmacist_name}": owner or merchant_name,
+            "{salon_name}": merchant_name,
+            "{restaurant_name}": merchant_name,
+            "{gym_name}": merchant_name,
+            "{pharmacy_name}": merchant_name,
+            "{clinic_name}": merchant_name,
+            "{store_name}": merchant_name,
+        }
+        for key, value in replacements.items():
+            if value:
+                template = template.replace(key, value)
+        if "{" in template:
+            fallback = owner or merchant_name or "there"
+            template = re.sub(r"\{[^}]+\}", fallback, template)
+        return template
+    if owner:
+        return owner
+    return merchant_name
+
+
+def _merchant_name(merchant: Dict[str, Any]) -> str:
+    return _safe_get(merchant, ["identity", "name"], "your business")
+
+
+def _merchant_locality(merchant: Dict[str, Any]) -> str:
+    locality = _safe_get(merchant, ["identity", "locality"], "")
+    city = _safe_get(merchant, ["identity", "city"], "")
+    if locality and city:
+        return f"{locality}, {city}"
+    return locality or city
+
+
+def _category_terms(category_slug: str) -> Dict[str, str]:
+    mapping = {
+        "dentists": {"business": "clinic", "audience": "patients"},
+        "salons": {"business": "salon", "audience": "clients"},
+        "restaurants": {"business": "restaurant", "audience": "diners"},
+        "gyms": {"business": "gym", "audience": "members"},
+        "pharmacies": {"business": "pharmacy", "audience": "patients"},
+    }
+    return mapping.get(category_slug, {"business": "business", "audience": "customers"})
+
+
+def _metric_label(metric: str, category_slug: str) -> str:
+    if metric == "calls":
+        mapping = {
+            "dentists": "patient calls",
+            "salons": "appointment calls",
+            "restaurants": "reservation calls",
+            "gyms": "member inquiries",
+            "pharmacies": "customer calls",
+        }
+        return mapping.get(category_slug, metric)
+    return metric
+
+
+def _category_lead(category_slug: str) -> str:
+    mapping = {
+        "dentists": "Quick clinical note",
+        "salons": "Quick one",
+        "restaurants": "Quick check",
+        "gyms": "Coach note",
+        "pharmacies": "Pharmacy note",
+    }
+    return mapping.get(category_slug, "Quick note")
+
+
+def _review_label(metric: str, category_slug: str) -> str:
+    if metric == "review_count":
+        return "Google reviews"
+    return metric
+
+
+def _perf_value(perf: Dict[str, Any], metric: str) -> Optional[Any]:
+    metric_map = {
+        "views": "views",
+        "calls": "calls",
+        "ctr": "ctr",
+        "directions": "directions",
+        "leads": "leads",
+    }
+    key = metric_map.get(metric)
+    return perf.get(key) if key else None
+
+
+def _peer_value(peer: Dict[str, Any], metric: str) -> Optional[Any]:
+    if metric == "ctr":
+        return peer.get("avg_ctr")
+    key = f"avg_{metric}_30d"
+    return peer.get(key)
+
+
+def _pct_abs(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return f"{round(value * 100, 1)}%"
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_trend(trend: str) -> str:
+    if not trend:
+        return ""
+    cleaned = trend.replace("_", " ")
+    match = re.search(r"([+-]\d+)$", cleaned)
+    if match:
+        value = match.group(1)
+        cleaned = cleaned[:match.start()].strip()
+        return f"{cleaned} {value}%"
+    return cleaned
 
 
 def _hi_en_mix(merchant: Dict[str, Any], customer: Optional[Dict[str, Any]]) -> bool:
@@ -92,6 +204,33 @@ def _pick_offer(merchant: Dict[str, Any], category: Dict[str, Any]) -> Optional[
         if offer.get("title"):
             return offer["title"]
     return None
+
+
+def _active_offers(merchant: Dict[str, Any]) -> List[str]:
+    titles = []
+    for offer in merchant.get("offers", []):
+        if offer.get("status") == "active" and offer.get("title"):
+            titles.append(offer["title"])
+    return titles
+
+
+def _action_for_category(category_slug: str, offer_title: Optional[str], stale_posts: bool) -> str:
+    if stale_posts:
+        if offer_title:
+            return f"draft 2 Google posts on {offer_title}"
+        return "draft 2 Google posts"
+
+    if category_slug == "pharmacies":
+        return "refresh your refill reminder"
+    if category_slug == "gyms":
+        return f"refresh {offer_title}" if offer_title else "refresh your membership offer"
+    if category_slug == "restaurants":
+        return f"refresh {offer_title}" if offer_title else "refresh your top combo"
+    if category_slug == "salons":
+        return f"refresh {offer_title}" if offer_title else "refresh your top service"
+    if category_slug == "dentists":
+        return f"refresh {offer_title}" if offer_title else "refresh your top service"
+    return f"refresh {offer_title}" if offer_title else "refresh your top offer"
 
 
 def _pick_digest_item(category: Dict[str, Any], item_id: str) -> Optional[Dict[str, Any]]:
@@ -158,8 +297,22 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
     send_as = "vera" if scope == "merchant" else "merchant_on_behalf"
     suppression_key = trigger.get("suppression_key") or f"trigger:{trigger.get('id')}"
 
+    category_slug = category.get("slug") or merchant.get("category_slug", "")
+    terms = _category_terms(category_slug)
+    business_noun = terms["business"]
+    audience_noun = terms["audience"]
+    merchant_name = _merchant_name(merchant)
+    locality = _merchant_locality(merchant)
+    locality_str = f" in {locality}" if locality else ""
+    perf = merchant.get("performance", {})
+    peer = category.get("peer_stats", {})
+
     salutation = _owner_name(merchant, category) if scope == "merchant" else _safe_get(customer or {}, ["identity", "name"], "there")
     intro = f"Hi {salutation}," if scope == "customer" else f"{salutation},"
+    lead = _category_lead(category_slug)
+    if "{" in intro:
+        fallback = _safe_get(merchant, ["identity", "owner_first_name"], "") or _merchant_name(merchant)
+        intro = re.sub(r"\{[^}]+\}", fallback, intro)
 
     offer_title = _pick_offer(merchant, category)
     hi_en = _hi_en_mix(merchant, customer)
@@ -176,9 +329,17 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         source = _safe_get(item or {}, ["source"], "")
         trial_n = _safe_get(item or {}, ["trial_n"], None)
         patient_segment = _safe_get(item or {}, ["patient_segment"], "")
+        actionable = _safe_get(item or {}, ["actionable"], "")
         trial_str = f"{trial_n}-patient" if trial_n else ""
         segment_str = f" for {patient_segment.replace('_', ' ')}" if patient_segment else ""
-        body = f"{intro} {title}. {trial_str}{segment_str}. Want me to pull the abstract and draft a patient-facing WhatsApp?"
+        risk_note = ""
+        if "high_risk_adult_cohort" in merchant.get("signals", []) and patient_segment:
+            risk_note = " Matches your high-risk adult cohort."
+        action_note = f" Actionable: {actionable}." if actionable else ""
+        body = (
+            f"{intro} {title}. {trial_str}{segment_str}.{risk_note}{action_note} "
+            f"Want me to pull the abstract and draft a {audience_noun}-facing WhatsApp?"
+        )
         if source:
             body = f"{body} — {source}"
         cta = "open_ended"
@@ -189,9 +350,11 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         item_id = _safe_get(trigger, ["payload", "top_item_id"], "")
         item = _pick_digest_item(category, item_id) if item_id else None
         title = _safe_get(item or {}, ["title"], "Regulatory update")
+        actionable = _safe_get(item or {}, ["actionable"], "")
         deadline = _safe_get(trigger, ["payload", "deadline_iso"], "")
         deadline_str = f"effective {deadline.split('T')[0]}" if deadline else "effective soon"
-        body = f"{intro} Heads-up: {title} ({deadline_str}). Want a 3-point compliance checklist?"
+        action_note = f" Action: {actionable}." if actionable else ""
+        body = f"{intro} Heads-up for your {business_noun}{locality_str}: {title} ({deadline_str}).{action_note} Want a 3-point compliance checklist?"
         source = _safe_get(item or {}, ["source"], "")
         if source:
             body = f"{body} — {source}"
@@ -208,28 +371,37 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         prefix = "Aapke liye" if hi_en else "For you"
         if slot_labels:
             body = (
-                f"{intro} {prefix} recall due since {last_service} (due {due_date}). "
+                f"{intro} {prefix} recall due since {last_service} (due {due_date}) at {merchant_name}. "
                 f"Slots ready: {slot_labels[0]} or {slot_labels[1] if len(slot_labels) > 1 else slot_labels[0]}. "
                 f"{offer}. Reply 1 for first, 2 for second, or share a preferred time."
             )
             cta = "multi_choice_slot"
         else:
-            body = f"{intro} {prefix} recall due since {last_service} (due {due_date}). Want me to hold a slot this week?"
+            body = f"{intro} {prefix} recall due since {last_service} (due {due_date}) at {merchant_name}. Want me to hold a slot this week?"
             cta = "binary_yes_no"
         rationale = "Customer recall trigger; use due date and provide specific slot choices."
         template_params = [salutation, due_date, offer]
 
     elif kind == "perf_dip":
         metric = _safe_get(trigger, ["payload", "metric"], "metric")
+        metric_text = _metric_label(metric, category_slug)
         delta_pct = _safe_get(trigger, ["payload", "delta_pct"], 0)
         window = _safe_get(trigger, ["payload", "window"], "7d")
         vs_baseline = _safe_get(trigger, ["payload", "vs_baseline"], None)
         baseline_str = f" (baseline {vs_baseline})" if vs_baseline is not None else ""
-        action = "draft 2 Google posts" if "stale_posts" in " ".join(merchant.get("signals", [])) else "refresh your top offer"
+        has_stale_posts = "stale_posts" in " ".join(merchant.get("signals", []))
         offer = offer_title or "your top service"
+        action = _action_for_category(category_slug, offer_title, has_stale_posts)
+        current_value = _perf_value(perf, metric)
+        peer_value = _peer_value(peer, metric)
+        peer_str = ""
+        if current_value is not None and peer_value is not None:
+            peer_val = _pct_abs(peer_value) if metric == "ctr" else str(peer_value)
+            cur_val = _pct_abs(current_value) if metric == "ctr" else str(current_value)
+            peer_str = f" (now {cur_val} vs peer {peer_val})"
         body = (
-            f"{intro} {metric} down {_pct(delta_pct)} over {window}{baseline_str}. "
-            f"I can {action} around {offer}. Want me to do that?"
+            f"{intro} {lead} — {metric_text} down {_pct(delta_pct)} over {window}{baseline_str}{peer_str}. "
+            f"I can {action} around {offer} for your {business_noun}{locality_str}. Want me to do that?"
         )
         cta = "binary_yes_no"
         rationale = "Performance dip trigger; connect metric drop to a specific corrective action."
@@ -241,7 +413,11 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         window = _safe_get(trigger, ["payload", "window"], "7d")
         driver = _safe_get(trigger, ["payload", "likely_driver"], "")
         driver_str = f" Likely driver: {driver}." if driver else ""
-        body = f"{intro} {metric} up {_pct(delta_pct)} over {window}.{driver_str} Want me to double down with a fresh post today?"
+        current_value = _perf_value(perf, metric)
+        cur_val = _pct_abs(current_value) if metric == "ctr" else str(current_value) if current_value is not None else ""
+        cur_str = f" (now {cur_val})" if cur_val else ""
+        offer_note = f" I can highlight {offer_title} today." if offer_title else ""
+        body = f"{intro} {lead} — {metric} up {_pct(delta_pct)} over {window}{cur_str}.{driver_str}{offer_note} Want me to double down with a fresh post today?"
         cta = "binary_yes_no"
         rationale = "Performance spike trigger; reinforce the likely driver and suggest doubling down."
         template_params = [salutation, metric, _pct(delta_pct)]
@@ -251,7 +427,21 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         plan = _safe_get(trigger, ["payload", "plan"], "")
         amount = _safe_get(trigger, ["payload", "renewal_amount"], None)
         amount_str = f" (renewal {amount})" if amount else ""
-        body = f"{intro} your {plan} plan renews in {days} days{amount_str}. Want me to send the renewal link?"
+        perf_bits = []
+        if perf.get("views") is not None:
+            perf_bits.append(f"{perf.get('views')} views")
+        if perf.get("calls") is not None:
+            perf_bits.append(f"{perf.get('calls')} calls")
+        if perf.get("ctr") is not None:
+            ctr_val = _pct_abs(perf.get("ctr"))
+            if ctr_val:
+                perf_bits.append(f"CTR {ctr_val}")
+        perf_str = ", ".join(perf_bits)
+        perf_tail = f" Last 30d: {perf_str}." if perf_str else ""
+        body = (
+            f"{intro} your {plan} plan for your {business_noun}{locality_str} renews in {days} days{amount_str}."
+            f"{perf_tail} Want me to send the renewal link?"
+        )
         cta = "binary_yes_no"
         rationale = "Renewal due trigger; clear timeline and one-step CTA."
         template_params = [salutation, str(days), plan]
@@ -259,8 +449,10 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
     elif kind == "festival_upcoming":
         festival = _safe_get(trigger, ["payload", "festival"], "festival")
         date = _safe_get(trigger, ["payload", "date"], "")
+        days_until = _safe_get(trigger, ["payload", "days_until"], None)
         offer = offer_title or "a festive offer"
-        body = f"{intro} {festival} is on {date}. Want me to draft a {festival} post using {offer}?"
+        days_note = f" ({days_until} days away)" if days_until is not None else ""
+        body = f"{intro} {festival} is on {date}{days_note}. Want me to draft a {festival} post using {offer} for your {business_noun}?"
         cta = "binary_yes_no"
         rationale = "Festival trigger; propose a timely post using their offer."
         template_params = [salutation, festival, date]
@@ -268,13 +460,19 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
     elif kind == "wedding_package_followup":
         wedding_date = _safe_get(trigger, ["payload", "wedding_date"], "")
         next_step = _safe_get(trigger, ["payload", "next_step_window_open"], "")
-        body = f"{intro} your wedding is on {wedding_date}. Want to lock the {next_step.replace('_', ' ')} slot this week?"
+        body = f"{intro} your wedding is on {wedding_date}. Want to lock the {next_step.replace('_', ' ')} slot at {merchant_name} this week?"
         cta = "binary_yes_no"
         rationale = "Bridal followup trigger; anchor to wedding date and next-step window."
         template_params = [salutation, wedding_date]
 
     elif kind == "curious_ask_due":
-        body = f"{intro} quick one — which service is getting the most asks this week?"
+        offers = _active_offers(merchant)
+        if len(offers) >= 2:
+            body = f"{intro} {lead} — this week are more asks for {offers[0]} or {offers[1]}?"
+        elif len(offers) == 1:
+            body = f"{intro} {lead} — are most asks this week for {offers[0]} or something else?"
+        else:
+            body = f"{intro} {lead} — which service is getting the most asks this week?"
         cta = "open_ended"
         rationale = "Curious ask trigger; light-touch engagement with a single question."
         template_params = [salutation]
@@ -282,8 +480,13 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
     elif kind == "winback_eligible":
         days = _safe_get(trigger, ["payload", "days_since_expiry"], None)
         lapsed = _safe_get(trigger, ["payload", "lapsed_customers_added_since_expiry"], None)
+        perf_dip = _safe_get(trigger, ["payload", "perf_dip_pct"], None)
+        perf_note = f" and performance down {_pct(perf_dip)}" if perf_dip is not None else ""
         offer = offer_title or "a winback offer"
-        body = f"{intro} it's been {days} days since expiry; {lapsed} lapsed customers added since then. Want me to send {offer} to a winback list?"
+        body = (
+            f"{intro} it has been {days} days since expiry{perf_note}; {lapsed} lapsed {audience_noun} added since then. "
+            f"Want me to send {offer} to a winback list?"
+        )
         cta = "binary_yes_no"
         rationale = "Winback trigger; cite days and lapsed count, propose a targeted winback send."
         template_params = [salutation, str(days), str(lapsed)]
@@ -292,7 +495,11 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         match = _safe_get(trigger, ["payload", "match"], "match")
         match_time = _safe_get(trigger, ["payload", "match_time_iso"], "")
         offer = offer_title or "a match-night offer"
-        body = f"{intro} {match} tonight ({match_time.split('T')[0]}). Want me to push a match-night post using {offer} for the 6pm window?"
+        time_label = "tonight"
+        if "T" in match_time:
+            time_part = match_time.split("T")[1]
+            time_label = time_part.split("+")[0]
+        body = f"{intro} {match} tonight ({time_label}). Want me to push a match-night post using {offer} for the 6pm window?"
         cta = "binary_yes_no"
         rationale = "IPL trigger; anchor to match timing and propose a targeted post."
         template_params = [salutation, match, offer]
@@ -302,29 +509,40 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         occurrences = _safe_get(trigger, ["payload", "occurrences_30d"], None)
         quote = _safe_get(trigger, ["payload", "common_quote"], "")
         quote_snip = f"\"{quote}\"" if quote else ""
-        body = f"{intro} {occurrences} reviews this month mention {theme}. {quote_snip} Want me to draft a public response + a quick fix note?"
+        body = (
+            f"{intro} {occurrences} reviews this month mention {theme} at your {business_noun}{locality_str}. "
+            f"{quote_snip} Want me to draft a public response + a quick fix note?"
+        )
         cta = "binary_yes_no"
         rationale = "Review theme trigger; show evidence and offer response + fix note."
         template_params = [salutation, theme, str(occurrences)]
 
     elif kind == "milestone_reached":
         metric = _safe_get(trigger, ["payload", "metric"], "metric")
+        metric_label = _review_label(metric, category_slug)
         value_now = _safe_get(trigger, ["payload", "value_now"], None)
         milestone = _safe_get(trigger, ["payload", "milestone_value"], None)
+        imminent = _safe_get(trigger, ["payload", "is_imminent"], False)
         gap = None
         if isinstance(value_now, (int, float)) and isinstance(milestone, (int, float)):
             gap = milestone - value_now
         gap_str = str(gap) if gap is not None else "a few"
-        body = f"{intro} you are at {value_now} {metric}s — just {gap_str} away from {milestone}. Want a quick review-ask message to hit it?"
+        note = " (almost there)" if imminent else ""
+        body = (
+            f"{intro} you are at {value_now} {metric_label}{note} at your {business_noun}{locality_str} — just {gap_str} away from {milestone}. "
+            "Want a 2-line review-ask you can send after the next visit?"
+        )
         cta = "binary_yes_no"
         rationale = "Milestone trigger; highlight the gap and offer a simple review-ask."
         template_params = [salutation, str(value_now), str(milestone)]
 
     elif kind == "active_planning_intent":
         intent = _safe_get(trigger, ["payload", "intent_topic"], "plan")
+        last_msg = _safe_get(trigger, ["payload", "merchant_last_message"], "")
         offer = offer_title or "your best-selling item"
+        last_note = f" You said: \"{last_msg}\"." if last_msg else ""
         body = (
-            f"{intro} I can draft a 3-point plan for {intent.replace('_', ' ')} using {offer} as the anchor. "
+            f"{intro} I can draft a 3-point plan for {intent.replace('_', ' ')} using {offer} as the anchor.{last_note} "
             "What minimum headcount should I assume?"
         )
         cta = "open_ended"
@@ -351,9 +569,11 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
 
     elif kind == "trial_followup":
         slots = _safe_get(trigger, ["payload", "next_session_options"], [])
+        trial_date = _safe_get(trigger, ["payload", "trial_date"], "")
         slot_labels = _render_slots(slots)
         if slot_labels:
-            body = f"{intro} thanks for the trial! Next slot: {slot_labels[0]}. Want me to book it?"
+            trial_note = f" on {trial_date}" if trial_date else ""
+            body = f"{intro} thanks for the trial{trial_note}! Next slot: {slot_labels[0]}. Want me to book it?"
             cta = "binary_yes_no"
         else:
             body = f"{intro} thanks for the trial! Want to schedule the next session?"
@@ -365,7 +585,12 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         molecule = _safe_get(trigger, ["payload", "molecule"], "")
         batches = _safe_get(trigger, ["payload", "affected_batches"], [])
         batch_str = ", ".join(batches[:2])
-        body = f"{intro} supply alert: {molecule} recall for batches {batch_str}. Want a staff checklist and customer notice draft?"
+        alert_id = _safe_get(trigger, ["payload", "alert_id"], "")
+        alert_item = _pick_digest_item(category, alert_id) if alert_id else None
+        source = _safe_get(alert_item or {}, ["source"], "")
+        body = f"{intro} supply alert for your {business_noun}: {molecule} recall, batches {batch_str}. Want a staff checklist and customer notice draft?"
+        if source:
+            body = f"{body} — {source}"
         cta = "binary_yes_no"
         rationale = "Supply alert trigger; list affected molecule and batches and offer checklist."
         template_params = [salutation, molecule, batch_str]
@@ -383,8 +608,10 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
 
     elif kind == "category_seasonal":
         trends = _safe_get(trigger, ["payload", "trends"], [])
-        top_trend = trends[0] if trends else "seasonal demand shift"
-        body = f"{intro} summer shift: {top_trend}. Want a quick shelf plan for the top 3 movers?"
+        shelf_action = _safe_get(trigger, ["payload", "shelf_action_recommended"], False)
+        top_trend = _format_trend(trends[0]) if trends else "seasonal demand shift"
+        shelf_str = " I can map a counter shelf plan." if shelf_action else ""
+        body = f"{intro} {lead} — summer shift: {top_trend}.{shelf_str} Want a quick plan for the top 3 movers at your {business_noun}?"
         cta = "binary_yes_no"
         rationale = "Seasonal category trigger; cite the top trend and offer a shelf plan."
         template_params = [salutation, top_trend]
@@ -392,8 +619,11 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
     elif kind == "gbp_unverified":
         path = _safe_get(trigger, ["payload", "verification_path"], "verification")
         uplift = _safe_get(trigger, ["payload", "estimated_uplift_pct"], None)
-        uplift_str = _pct(uplift) if uplift is not None else ""
-        body = f"{intro} your GBP is unverified. Verification via {path} can lift calls by {uplift_str}. Want me to start it?"
+        uplift_str = _pct_abs(uplift) if uplift is not None else ""
+        body = (
+            f"{intro} your {business_noun} GBP is unverified. Verification via {path} can lift calls by {uplift_str}. "
+            "Want me to start it?"
+        )
         cta = "binary_yes_no"
         rationale = "GBP unverified trigger; clear benefit and action."
         template_params = [salutation, path, uplift_str]
@@ -414,14 +644,20 @@ def compose(category: Dict[str, Any], merchant: Dict[str, Any], trigger: Dict[st
         distance = _safe_get(trigger, ["payload", "distance_km"], None)
         their_offer = _safe_get(trigger, ["payload", "their_offer"], "")
         offer = offer_title or "your top offer"
-        body = f"{intro} {name} opened {distance} km away offering {their_offer}. Want me to counter with a post featuring {offer}?"
+        dist_str = f"{distance} km" if distance is not None else "nearby"
+        body = (
+            f"{intro} {name} opened {dist_str} away offering {their_offer}. "
+            f"Want me to counter with a post featuring {offer} for your {business_noun}?"
+        )
         cta = "binary_yes_no"
         rationale = "Competitor trigger; name, distance, offer; propose a counter-post."
         template_params = [salutation, name, offer]
 
     elif kind == "dormant_with_vera":
         days = _safe_get(trigger, ["payload", "days_since_last_merchant_message"], None)
-        body = f"{intro} it has been {days} days since we last spoke. Want a quick 2-line update on your profile health?"
+        last_topic = _safe_get(trigger, ["payload", "last_topic"], "")
+        topic_str = f" (last topic: {last_topic})" if last_topic else ""
+        body = f"{intro} it has been {days} days since we last spoke{topic_str}. Want a quick 2-line update on your profile health?"
         cta = "binary_yes_no"
         rationale = "Dormancy trigger; low-friction re-entry question."
         template_params = [salutation, str(days)]
